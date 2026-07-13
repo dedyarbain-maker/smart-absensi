@@ -1,0 +1,500 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import * as XLSX from "xlsx";
+import {
+  Camera, MapPin, Clock, School, User, Check, X, Loader2, Trash2,
+  RefreshCw, ShieldCheck, AlertCircle, ImageOff, Filter, Download,
+} from "lucide-react";
+
+const STORAGE_KEY = "absensi-entries";
+
+// Koordinat & radius maksimal (meter) untuk validasi lokasi absen per sekolah.
+// Sekolah yang tidak terdaftar di sini akan dilewati dari validasi radius.
+const SCHOOL_COORDS = {
+  "SMPN 8 Mesuji": { lat: -3.9012, lng: 105.6234, radius: 200 },
+  "SMPN 9 Mesuji": { lat: -3.9087, lng: 105.6301, radius: 200 },
+  "SMPN 13 Mesuji": { lat: -3.8965, lng: 105.6178, radius: 200 },
+  "SMPN 15 Mesuji": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMPN Satu Atap 1 Mesuji": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMPN Satu Atap 2 Mesuji": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMPN Satu Atap 1 Rawajitu Utara": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMP Pangkal Mas": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMP Karya Utama": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMP Al Yazier": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMP Subulussalam": { lat: -3.9143, lng: 105.6355, radius: 200 },
+  "SMP Takhasus Al Qudsiyah": { lat: -3.9143, lng: 105.6355, radius: 200 },
+};
+const SEKOLAH_OPTIONS = Object.keys(SCHOOL_COORDS);
+
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function formatWaktu(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta", weekday: "long", day: "2-digit", month: "long",
+    year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }) + " WIB";
+}
+
+function resizeImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Gagal membaca file"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Gagal memuat gambar"));
+      img.onload = () => {
+        const maxW = 360;
+        const scale = Math.min(1, maxW / img.width);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.62));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+export default function AbsensiGuru() {
+  const [now, setNow] = useState(new Date());
+  const [schoolName, setSchoolName] = useState("");
+  const [teacherName, setTeacherName] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [photoError, setPhotoError] = useState("");
+  const [loc, setLoc] = useState(null); // {lat,lng,accuracy}
+  const [manualLoc, setManualLoc] = useState("");
+  const [locating, setLocating] = useState(false);
+  const [locError, setLocError] = useState("");
+  const [entries, setEntries] = useState([]);
+  const [loadingEntries, setLoadingEntries] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitMsg, setSubmitMsg] = useState("");
+  const [schoolFilter, setSchoolFilter] = useState("Semua Sekolah");
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const loadEntries = useCallback(async () => {
+    setLoadingEntries(true);
+    try {
+      const res = await window.storage.get(STORAGE_KEY, true);
+      setEntries(res ? JSON.parse(res.value) : []);
+    } catch (e) {
+      setEntries([]);
+    }
+    setLoadingEntries(false);
+  }, []);
+
+  useEffect(() => { loadEntries(); }, [loadEntries]);
+
+  async function saveEntries(next) {
+    setEntries(next);
+    try {
+      const res = await window.storage.set(STORAGE_KEY, JSON.stringify(next), true);
+      if (!res) console.error("Gagal menyimpan data absensi");
+    } catch (e) {
+      console.error("Storage error:", e);
+    }
+  }
+
+  function handlePhotoPick(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setPhotoError("");
+    resizeImage(file).then(setPhoto).catch(() => setPhotoError("Foto gagal diproses, coba ambil ulang."));
+  }
+
+  function ambilLokasi() {
+    setLocError("");
+    if (!navigator.geolocation) {
+      setLocError("Perangkat ini tidak mendukung deteksi lokasi. Isi lokasi manual di bawah.");
+      return;
+    }
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLoc({
+          lat: pos.coords.latitude.toFixed(6),
+          lng: pos.coords.longitude.toFixed(6),
+          accuracy: Math.round(pos.coords.accuracy),
+        });
+        setLocating(false);
+      },
+      (err) => {
+        setLocError("Tidak bisa mengambil lokasi (" + err.message + "). Isi lokasi manual di bawah.");
+        setLocating(false);
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }
+
+  const schoolCoord = SCHOOL_COORDS[schoolName.trim()];
+  const distanceToSchool = useMemo(() => {
+    if (!loc || !schoolCoord) return null;
+    return distanceMeters(parseFloat(loc.lat), parseFloat(loc.lng), schoolCoord.lat, schoolCoord.lng);
+  }, [loc, schoolCoord]);
+  const outOfRadius = schoolCoord && loc && distanceToSchool !== null && distanceToSchool > schoolCoord.radius;
+
+  const hasLocation = loc || manualLoc.trim().length > 0;
+  const canSubmit = schoolName.trim() && teacherName.trim() && photo && hasLocation && !submitting && !outOfRadius;
+
+  async function submit() {
+    if (!canSubmit) return;
+    setSubmitting(true);
+    setSubmitMsg("");
+    const entry = {
+      id: Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+      schoolName: schoolName.trim(),
+      teacherName: teacherName.trim(),
+      photo,
+      lat: loc ? loc.lat : null,
+      lng: loc ? loc.lng : null,
+      accuracy: loc ? loc.accuracy : null,
+      manualLoc: loc ? "" : manualLoc.trim(),
+      distanceToSchool: distanceToSchool !== null ? Math.round(distanceToSchool) : null,
+      timestamp: new Date().toISOString(),
+    };
+    const next = [entry, ...entries];
+    await saveEntries(next);
+    setSubmitting(false);
+    setSubmitMsg("Kehadiran berhasil dicatat.");
+    setPhoto(null);
+    setLoc(null);
+    setManualLoc("");
+    setTeacherName("");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setTimeout(() => setSubmitMsg(""), 4000);
+  }
+
+  async function hapusEntri(id) {
+    const next = entries.filter((e) => e.id !== id);
+    await saveEntries(next);
+  }
+
+  const todayStr = now.toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta" });
+  const uniqueSchools = Array.from(new Set([...SEKOLAH_OPTIONS, ...entries.map((e) => e.schoolName)]));
+  const filteredEntries = entries
+    .filter((e) => schoolFilter === "Semua Sekolah" || e.schoolName === schoolFilter)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  function exportExcel() {
+    const rows = filteredEntries.map((e, i) => {
+      const coord = SCHOOL_COORDS[e.schoolName];
+      let status = "Lokasi manual";
+      if (e.lat) {
+        if (coord && e.distanceToSchool !== null && e.distanceToSchool !== undefined) {
+          status = e.distanceToSchool <= coord.radius ? "Dalam radius" : "Di luar radius";
+        } else {
+          status = "Radius tidak diverifikasi";
+        }
+      }
+      return {
+        No: i + 1,
+        "Nama Guru": e.teacherName,
+        "Nama Sekolah": e.schoolName,
+        Tanggal: new Date(e.timestamp).toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta" }),
+        Waktu: new Date(e.timestamp).toLocaleTimeString("id-ID", { timeZone: "Asia/Jakarta" }),
+        Latitude: e.lat || "",
+        Longitude: e.lng || "",
+        "Akurasi (m)": e.accuracy || "",
+        "Lokasi Manual": e.manualLoc || "",
+        "Jarak dari Sekolah (m)": e.distanceToSchool ?? "",
+        "Status Lokasi": status,
+      };
+    });
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws["!cols"] = [
+      { wch: 4 }, { wch: 20 }, { wch: 24 }, { wch: 12 }, { wch: 10 },
+      { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 24 }, { wch: 14 }, { wch: 16 },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Absensi");
+    const label = (schoolFilter === "Semua Sekolah" ? "Semua_Sekolah" : schoolFilter).replace(/\s+/g, "_");
+    XLSX.writeFile(wb, `Rekap_Absensi_${label}_${todayStr.replace(/\//g, "-")}.xlsx`);
+  }
+
+  return (
+    <div className="wrap">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,650;8..60,800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        *{box-sizing:border-box;}
+        :root{
+          --ink:#1C2B3A; --paper:#F4F1E6; --card:#FFFFFF;
+          --navy:#1F3A5F; --navy-dark:#142840; --navy-tint:#E4EAF1;
+          --gold:#C89B3C; --gold-tint:#F2E6C9;
+          --green:#3E7A4D; --green-tint:#E1EDE2;
+          --red:#B4402A; --red-tint:#F5E1DC;
+          --muted:#6E6858; --line:#DED5B8;
+          --font-d:'Source Serif 4', serif; --font-b:'IBM Plex Sans', sans-serif; --font-m:'IBM Plex Mono', monospace;
+        }
+        .wrap{
+          min-height:640px; width:100%; font-family:var(--font-b); color:var(--ink);
+          background:
+            linear-gradient(var(--paper), var(--paper)),
+            repeating-linear-gradient(0deg, rgba(31,58,95,0.035) 0 1px, transparent 1px 26px);
+          padding:26px 14px 60px; display:flex; justify-content:center;
+        }
+        .sheet{width:100%; max-width:560px;}
+        .letterhead{
+          background:var(--navy); color:#fff; border-radius:16px 16px 0 0; padding:20px 22px;
+          display:flex; align-items:center; gap:14px; position:relative; overflow:hidden;
+        }
+        .letterhead::after{content:''; position:absolute; right:-30px; top:-30px; width:120px; height:120px; border-radius:50%; background:rgba(255,255,255,0.06);}
+        .seal{
+          width:46px; height:46px; border-radius:50%; background:var(--gold); color:var(--navy-dark);
+          display:flex; align-items:center; justify-content:center; flex-shrink:0; box-shadow:0 0 0 3px rgba(255,255,255,0.25);
+        }
+        .letterhead h1{font-family:var(--font-d); font-weight:700; font-size:21px; margin:0; letter-spacing:0.01em;}
+        .letterhead .sub{font-size:12px; opacity:0.8; margin-top:2px;}
+        .clock{
+          margin-left:auto; text-align:right; font-family:var(--font-m); font-size:12px; opacity:0.9; flex-shrink:0;
+        }
+        .clock .time{font-size:16px; font-weight:600;}
+
+        .card{background:var(--card); border:1px solid var(--line); border-top:none; padding:22px; border-radius:0 0 16px 16px; box-shadow:0 18px 40px -24px rgba(20,25,10,0.35);}
+        .field{margin-bottom:16px;}
+        .label{font-size:11.5px; text-transform:uppercase; letter-spacing:0.06em; font-weight:700; color:var(--navy); display:flex; align-items:center; gap:6px; margin-bottom:7px;}
+        .input, select.input{
+          width:100%; padding:11px 13px; border:1.5px solid var(--line); border-radius:10px; font-family:var(--font-b);
+          font-size:14px; background:#FCFAF3; outline:none; color:var(--ink);
+        }
+        .input:focus{border-color:var(--navy);}
+        .row{display:flex; gap:12px;}
+        .row > *{flex:1;}
+
+        .photobox{
+          border:1.5px dashed var(--line); border-radius:12px; padding:14px; display:flex; align-items:center; gap:14px; background:#FCFAF3; cursor:pointer;
+        }
+        .photobox img{width:64px; height:64px; border-radius:10px; object-fit:cover; flex-shrink:0;}
+        .photobox .ph-placeholder{width:64px; height:64px; border-radius:10px; background:var(--navy-tint); display:flex; align-items:center; justify-content:center; color:var(--navy); flex-shrink:0;}
+        .photobox .ph-text{font-size:13px; font-weight:600;}
+        .photobox .ph-sub{font-size:11.5px; color:var(--muted); margin-top:2px;}
+
+        .locbox{border:1.5px solid var(--line); border-radius:12px; padding:14px; background:#FCFAF3;}
+        .locbtn{
+          display:flex; align-items:center; justify-content:center; gap:8px; padding:11px; border-radius:10px; border:none;
+          background:var(--navy); color:#fff; font-weight:600; font-size:13.5px; cursor:pointer; width:100%;
+        }
+        .locbtn:disabled{opacity:0.6;}
+        .locresult{margin-top:12px; padding:11px 12px; background:var(--green-tint); border-radius:10px; font-family:var(--font-m); font-size:12.5px; color:#255030; display:flex; align-items:center; gap:8px;}
+        .radiusbox{margin-top:8px; padding:10px 12px; border-radius:10px; font-size:12px; display:flex; align-items:center; gap:7px; font-weight:600;}
+        .radiusbox.good{background:var(--green-tint); color:#255030;}
+        .radiusbox.bad{background:var(--red-tint); color:var(--red);}
+        .radiusbox.neutral{background:var(--gold-tint); color:#7A5B14;}
+        .locerror{margin-top:10px; font-size:12px; color:var(--red); display:flex; gap:6px; align-items:flex-start;}
+        .manualwrap{margin-top:10px;}
+
+        .submitbtn{
+          width:100%; padding:14px; border-radius:12px; border:none; background:var(--gold); color:var(--navy-dark);
+          font-weight:700; font-size:14.5px; display:flex; align-items:center; justify-content:center; gap:8px; cursor:pointer; margin-top:6px;
+        }
+        .submitbtn:disabled{opacity:0.45; cursor:not-allowed;}
+        .successmsg{
+          margin-top:12px; padding:11px 13px; background:var(--green-tint); color:#255030; border-radius:10px;
+          font-size:13px; font-weight:600; display:flex; align-items:center; gap:8px;
+        }
+
+        .sectionhead{display:flex; align-items:center; justify-content:space-between; margin:26px 0 12px; flex-wrap:wrap; gap:10px;}
+        .sectionhead h2{font-family:var(--font-d); font-size:17px; font-weight:650; margin:0;}
+        .sectionhead .count{font-family:var(--font-m); font-size:12px; color:var(--muted);}
+        .filterrow{display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap;}
+        .filterselect{
+          display:flex; align-items:center; gap:7px; padding:9px 12px; border:1.5px solid var(--line); border-radius:10px;
+          background:#FCFAF3; font-size:13px; flex:1; min-width:160px;
+        }
+        .filterselect select{border:none; background:transparent; outline:none; font-family:var(--font-b); font-size:13px; color:var(--ink); width:100%;}
+        .exportbtn{
+          display:flex; align-items:center; gap:7px; padding:9px 14px; border-radius:10px; border:1.5px solid var(--navy);
+          background:var(--navy); color:#fff; font-weight:600; font-size:13px; cursor:pointer; white-space:nowrap;
+        }
+        .exportbtn:disabled{opacity:0.4; cursor:not-allowed;}
+
+        .ticket{
+          background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px 16px; margin-bottom:12px;
+          display:flex; gap:12px; position:relative;
+        }
+        .ticket img{width:52px; height:52px; border-radius:9px; object-fit:cover; flex-shrink:0;}
+        .ticket .noimg{width:52px; height:52px; border-radius:9px; background:var(--navy-tint); display:flex; align-items:center; justify-content:center; color:var(--navy); flex-shrink:0;}
+        .ticket-name{font-weight:700; font-size:14px;}
+        .ticket-school{font-size:12px; color:var(--navy); font-weight:600; margin-top:1px;}
+        .ticket-meta{font-family:var(--font-m); font-size:11px; color:var(--muted); margin-top:6px; display:flex; flex-direction:column; gap:2px;}
+        .ticket-badge{
+          position:absolute; top:12px; right:12px; background:var(--green-tint); color:var(--green); font-size:10px; font-weight:700;
+          padding:3px 8px; border-radius:100px; display:flex; align-items:center; gap:4px;
+        }
+        .delbtn{
+          position:absolute; bottom:12px; right:12px; width:26px; height:26px; border-radius:8px; border:1px solid var(--line);
+          background:#fff; display:flex; align-items:center; justify-content:center; cursor:pointer; color:var(--red);
+        }
+        .empty{text-align:center; padding:30px 10px; color:var(--muted); font-size:13px;}
+        .spin{animation:spin 1s linear infinite;}
+        @keyframes spin{to{transform:rotate(360deg);}}
+        .notice{font-size:11.5px; color:var(--muted); text-align:center; margin-top:18px; line-height:1.5;}
+        .credit{
+          text-align:center; margin-top:10px; margin-bottom:4px;
+          font-family:var(--font-m); font-size:11px; font-weight:600; letter-spacing:0.08em;
+          color:var(--navy); opacity:0.7;
+        }
+      `}</style>
+
+      <div className="sheet">
+        <div className="letterhead">
+          <div className="seal"><ShieldCheck size={22} /></div>
+          <div>
+            <h1>Absensi GTK</h1>
+            <div className="sub">Sistem Kehadiran Digital · Kabupaten Mesuji</div>
+          </div>
+          <div className="clock">
+            <div>{now.toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta", weekday: "short", day: "2-digit", month: "short", year: "numeric" })}</div>
+            <div className="time">{now.toLocaleTimeString("id-ID", { timeZone: "Asia/Jakarta" })}</div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="field">
+            <div className="label"><School size={14} /> Nama Sekolah</div>
+            <input
+              className="input" list="sekolah-list" placeholder="Pilih atau ketik nama sekolah"
+              value={schoolName} onChange={(e) => setSchoolName(e.target.value)}
+            />
+            <datalist id="sekolah-list">
+              {SEKOLAH_OPTIONS.map((s) => <option key={s} value={s} />)}
+            </datalist>
+          </div>
+
+          <div className="field">
+            <div className="label"><User size={14} /> Nama Guru</div>
+            <input className="input" placeholder="Nama lengkap guru" value={teacherName} onChange={(e) => setTeacherName(e.target.value)} />
+          </div>
+
+          <div className="field">
+            <div className="label"><Camera size={14} /> Foto Kehadiran</div>
+            <div className="photobox" onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+              {photo ? <img src={photo} alt="Foto absensi" /> : <div className="ph-placeholder"><Camera size={22} /></div>}
+              <div>
+                <div className="ph-text">{photo ? "Foto siap dikirim" : "Ambil atau unggah foto"}</div>
+                <div className="ph-sub">{photo ? "Ketuk untuk mengganti foto" : "Gunakan kamera depan untuk swafoto kehadiran"}</div>
+              </div>
+            </div>
+            <input ref={fileInputRef} type="file" accept="image/*" capture="user" style={{ display: "none" }} onChange={handlePhotoPick} />
+            {photoError && <div className="locerror"><AlertCircle size={13} /> {photoError}</div>}
+          </div>
+
+          <div className="field">
+            <div className="label"><MapPin size={14} /> Lokasi</div>
+            <div className="locbox">
+              <button className="locbtn" onClick={ambilLokasi} disabled={locating}>
+                {locating ? <Loader2 size={16} className="spin" /> : <MapPin size={16} />}
+                {locating ? "Mendeteksi lokasi…" : "Ambil Lokasi Saat Ini"}
+              </button>
+              {loc && (
+                <div className="locresult">
+                  <Check size={14} />
+                  {loc.lat}, {loc.lng} · akurasi ±{loc.accuracy}m
+                </div>
+              )}
+              {loc && schoolCoord && distanceToSchool !== null && (
+                <div className={outOfRadius ? "radiusbox bad" : "radiusbox good"}>
+                  {outOfRadius ? <AlertCircle size={13} /> : <Check size={13} />}
+                  {Math.round(distanceToSchool)}m dari {schoolName.trim()} (maks {schoolCoord.radius}m)
+                  {outOfRadius ? " — terlalu jauh, absen ditolak." : " — dalam radius, absen diizinkan."}
+                </div>
+              )}
+              {loc && schoolName.trim() && !schoolCoord && (
+                <div className="radiusbox neutral">
+                  <AlertCircle size={13} /> Koordinat sekolah ini belum terdaftar, radius tidak diverifikasi.
+                </div>
+              )}
+              {locError && <div className="locerror"><AlertCircle size={13} /> {locError}</div>}
+              <div className="manualwrap">
+                <input
+                  className="input" placeholder="Atau isi lokasi manual, mis. Depan SDN 1 Mesuji Timur"
+                  value={manualLoc} onChange={(e) => setManualLoc(e.target.value)} disabled={!!loc}
+                  style={{ opacity: loc ? 0.5 : 1 }}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="field">
+            <div className="label"><Clock size={14} /> Waktu Absen</div>
+            <input className="input" readOnly value={formatWaktu(now.toISOString())} style={{ fontFamily: "var(--font-m)", fontSize: 13 }} />
+          </div>
+
+          <button className="submitbtn" disabled={!canSubmit} onClick={submit}>
+            {submitting ? <Loader2 size={17} className="spin" /> : <Check size={17} />}
+            {submitting ? "Menyimpan…" : "Catat Kehadiran"}
+          </button>
+          {submitMsg && <div className="successmsg"><Check size={15} /> {submitMsg}</div>}
+        </div>
+
+        <div className="sectionhead">
+          <h2>Riwayat Absensi</h2>
+          <span className="count">{loadingEntries ? "memuat…" : filteredEntries.length + " entri"}</span>
+        </div>
+
+        <div className="filterrow">
+          <div className="filterselect">
+            <Filter size={14} />
+            <select value={schoolFilter} onChange={(e) => setSchoolFilter(e.target.value)}>
+              <option value="Semua Sekolah">Semua Sekolah</option>
+              {uniqueSchools.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <button className="exportbtn" onClick={exportExcel} disabled={filteredEntries.length === 0}>
+            <Download size={15} /> Ekspor Excel
+          </button>
+        </div>
+
+        {loadingEntries ? (
+          <div className="empty"><Loader2 size={18} className="spin" /></div>
+        ) : filteredEntries.length === 0 ? (
+          <div className="empty">Belum ada data absensi untuk filter ini.</div>
+        ) : (
+          filteredEntries.map((e) => {
+            const coord = SCHOOL_COORDS[e.schoolName];
+            const badOne = coord && e.distanceToSchool !== null && e.distanceToSchool !== undefined && e.distanceToSchool > coord.radius;
+            return (
+              <div className="ticket" key={e.id}>
+                {e.photo ? <img src={e.photo} alt={e.teacherName} /> : <div className="noimg"><ImageOff size={18} /></div>}
+                <div style={{ flex: 1 }}>
+                  <div className="ticket-name">{e.teacherName}</div>
+                  <div className="ticket-school">{e.schoolName}</div>
+                  <div className="ticket-meta">
+                    <span>{formatWaktu(e.timestamp)}</span>
+                    <span>{e.lat ? e.lat + ", " + e.lng + " (±" + e.accuracy + "m)" : (e.manualLoc || "Lokasi tidak tercatat")}</span>
+                    {e.lat && coord && e.distanceToSchool !== null && e.distanceToSchool !== undefined && (
+                      <span>{e.distanceToSchool}m dari sekolah</span>
+                    )}
+                  </div>
+                </div>
+                <div className="ticket-badge" style={badOne ? { background: "var(--red-tint)", color: "var(--red)" } : undefined}>
+                  <Check size={11} /> {badOne ? "Di luar radius" : "Hadir"}
+                </div>
+                <div className="delbtn" onClick={() => hapusEntri(e.id)}><Trash2 size={13} /></div>
+              </div>
+            );
+          })
+        )}
+
+        <div className="notice">
+          Data absensi (termasuk foto dan lokasi) disimpan bersama dan dapat dilihat oleh siapa pun yang menggunakan aplikasi ini.
+        </div>
+        <div className="credit">by Deddy Ngabalin</div>
+      </div>
+    </div>
+  );
+}
